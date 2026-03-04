@@ -1,0 +1,117 @@
+# ===========================================================================
+# Security Sidecar - Orchestrator
+# ===========================================================================
+# Drop this entire .github/workflows/ folder into any repository, then run:
+#
+#   gh aw compile
+#
+# to generate the .lock.yml files for each agentic workflow.
+#
+# Use the "scans" input to choose which security scans to execute.
+# On schedule all three run; on manual dispatch you pick.
+#
+# Each scan is dispatched as an independent workflow run via the GitHub API.
+# This avoids artifact-name collisions that occur when multiple gh-aw
+# agentic workflows share a single workflow run (they all use the same
+# internal artifact names: prompt, agent-output, safe-output, etc.).
+# ===========================================================================
+name: Security Sidecar
+
+on:
+  schedule:
+    - cron: '0 6 * * *'               # daily at 06:00 UTC — adjust to taste
+  workflow_dispatch:
+    inputs:
+      scans:
+        description: 'Which scans to run'
+        required: false
+        default: 'secrets,malicious-code,github-security'
+        type: choice
+        options:
+          - 'secrets,malicious-code,github-security'
+          - 'secrets'
+          - 'malicious-code'
+          - 'github-security'
+          - 'secrets,malicious-code'
+          - 'secrets,github-security'
+          - 'malicious-code,github-security'
+
+concurrency:
+  group: security-sidecar-${{ github.ref }}
+  cancel-in-progress: false
+
+# --------------------------------------------------------------------------
+# Only actions: write is needed — the orchestrator dispatches each scan as
+# its own workflow run.  Each .lock.yml declares its own permissions.
+# --------------------------------------------------------------------------
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  # -----------------------------------------------------------------------
+  # 1. Parse the "scans" input and dispatch each agentic workflow
+  #    as a separate workflow run via `gh workflow run`.
+  #
+  #    Each .lock.yml runs in its own workflow run, so there are no
+  #    artifact-name collisions between the gh-aw internal artifacts.
+  # -----------------------------------------------------------------------
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse selected scans
+        id: cfg
+        env:
+          SCANS: ${{ inputs.scans || 'secrets,malicious-code,github-security' }}
+        run: |
+          run() { echo "$SCANS" | grep -qi "$1" && echo true || echo false; }
+          echo "run_secrets=$(run secrets)"                     >> "$GITHUB_OUTPUT"
+          echo "run_malicious_code=$(run malicious-code)"       >> "$GITHUB_OUTPUT"
+          echo "run_github_security=$(run github-security)"     >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch Secrets Analysis
+        if: steps.cfg.outputs.run_secrets == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Dispatching secrets-analysis..."
+          gh workflow run secrets-analysis.lock.yml --repo "${{ github.repository }}"
+          echo "  ✓ dispatched"
+
+      - name: Dispatch Malicious Code Scan
+        if: steps.cfg.outputs.run_malicious_code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Dispatching malicious-code-scan..."
+          gh workflow run malicious-code-scan.lock.yml --repo "${{ github.repository }}"
+          echo "  ✓ dispatched"
+
+      - name: Dispatch GitHub Security Scan
+        if: steps.cfg.outputs.run_github_security == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Dispatching github-security..."
+          gh workflow run github-security.lock.yml --repo "${{ github.repository }}"
+          echo "  ✓ dispatched"
+
+      - name: Summary
+        env:
+          RS: ${{ steps.cfg.outputs.run_secrets }}
+          RM: ${{ steps.cfg.outputs.run_malicious_code }}
+          RG: ${{ steps.cfg.outputs.run_github_security }}
+        run: |
+          dispatched() { [ "$1" = "true" ] && echo "dispatched" || echo "skipped"; }
+          {
+            echo "## Security Sidecar — Dispatch Summary"
+            echo ""
+            echo "| Scan | Status |"
+            echo "|------|--------|"
+            echo "| Secrets Analysis    | $(dispatched "$RS") |"
+            echo "| Malicious Code Scan | $(dispatched "$RM") |"
+            echo "| GitHub Security     | $(dispatched "$RG") |"
+            echo ""
+            echo "Each scan runs as an independent workflow run."
+            echo "Check the **Actions** tab for individual results."
+          } >> "$GITHUB_STEP_SUMMARY"
